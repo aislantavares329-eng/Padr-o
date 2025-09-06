@@ -38,46 +38,6 @@ if uploaded_file is not None:
         st.write("📋 Colunas detectadas:", cols)
 
         # ==============================
-        # Correlação numérica
-        # ==============================
-        st.subheader("📉 Correlação entre duas colunas numéricas")
-        col_x = st.selectbox("👉 Primeira coluna (X)", cols, key="numx")
-        col_y = st.selectbox("👉 Segunda coluna (Y)", cols, key="numy")
-
-        corr_val, insight, df_corr = None, None, None
-        try:
-            if col_x and col_y:
-                df_corr = df[[col_x, col_y]].dropna()
-                df_corr[col_x] = pd.to_numeric(df_corr[col_x], errors="coerce")
-                df_corr[col_y] = pd.to_numeric(df_corr[col_y], errors="coerce")
-                df_corr = df_corr.dropna()
-
-                if not df_corr.empty and MATPLOTLIB_OK:
-                    fig, ax = plt.subplots()
-                    ax.scatter(df_corr[col_x], df_corr[col_y], alpha=0.6)
-                    ax.set_xlabel(col_x)
-                    ax.set_ylabel(col_y)
-                    st.pyplot(fig)
-
-                    corr_val = df_corr[col_x].corr(df_corr[col_y])
-                    st.write(f"🔗 Correlação de Pearson: **{corr_val:.2f}**")
-
-                    if corr_val > 0.7:
-                        insight = "📈 Forte correlação positiva."
-                    elif corr_val < -0.7:
-                        insight = "📉 Forte correlação negativa."
-                    elif -0.3 < corr_val < 0.3:
-                        insight = "⚪ Correlação fraca ou inexistente."
-                    else:
-                        insight = "🟡 Correlação moderada."
-
-                    st.info(insight)
-                else:
-                    st.warning("⚠️ Dados insuficientes ou matplotlib indisponível.")
-        except Exception as e:
-            st.error(f"❌ Erro ao calcular correlação: {e}")
-
-        # ==============================
         # Relação categórica
         # ==============================
         st.subheader("📊 Relação entre duas colunas categóricas")
