@@ -55,8 +55,33 @@ if uploaded_file is not None:
 
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
-                        dist = df[col_b].value_counts()
-                        st.pyplot(dist.plot.pie(autopct="%1.1f%%", figsize=(5, 5)).get_figure())
+                        dist = df[col_b].value_counts(normalize=True) * 100  # porcentagem
+                        dist = dist.sort_values(ascending=False)
+
+                        # Agrupar categorias pequenas (<5%)
+                        outros = dist[dist < 5].sum()
+                        dist = dist[dist >= 5]
+                        if outros > 0:
+                            dist["Outros"] = outros
+
+                        fig, ax = plt.subplots(figsize=(7, 6))
+                        wedges, texts, autotexts = ax.pie(
+                            dist,
+                            autopct="%1.1f%%",
+                            startangle=90,
+                            counterclock=False,
+                            colors=plt.cm.tab20.colors
+                        )
+                        # Legenda fora do gráfico
+                        ax.legend(
+                            wedges,
+                            dist.index,
+                            title=f"{col_b}",
+                            loc="center left",
+                            bbox_to_anchor=(1, 0, 0.5, 1)
+                        )
+                        ax.set_title(f"Distribuição de {col_b}", fontsize=14)
+                        st.pyplot(fig)
 
                     maior = relacao.loc[relacao["QTD"].idxmax()]
                     diag = (
@@ -80,24 +105,6 @@ if uploaded_file is not None:
                 with pd.ExcelWriter(saida, engine="xlsxwriter") as writer:
                     wb = writer.book
                     df.to_excel(writer, sheet_name="Base", index=False)
-
-                    if df_corr is not None and corr_val is not None:
-                        df_corr.to_excel(writer, sheet_name="Correlação", index=False)
-                        ws = writer.sheets["Correlação"]
-                        ws.write(len(df_corr) + 2, 0, "Coeficiente de Correlação (Pearson):")
-                        ws.write(len(df_corr) + 2, 1, corr_val)
-                        if insight:
-                            ws.write(len(df_corr) + 3, 0, "Insight:")
-                            ws.write(len(df_corr) + 3, 1, insight)
-
-                        chart = wb.add_chart({"type": "scatter"})
-                        chart.add_series({
-                            "categories": ["Correlação", 1, 0, len(df_corr), 0],
-                            "values": ["Correlação", 1, 1, len(df_corr), 1],
-                            "name": f"{col_x} vs {col_y}"
-                        })
-                        chart.set_title({"name": f"{col_x} x {col_y}"})
-                        ws.insert_chart("E2", chart)
 
                     if relacao is not None:
                         relacao.to_excel(writer, sheet_name="Relação", index=False)
