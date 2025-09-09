@@ -1,25 +1,27 @@
 # app.py — Analisador Dinâmico de Planilhas
-# Barras com Altair, pizza original, diagnóstico original
-# IA do manual com PDF (pypdf/PyPDF2) + CSV fallback, alias + fuzzy + jaccard
+# Barras (Altair), pizza (matplotlib) intacta, diagnóstico original,
+# IA do manual priorizando PDF (pypdf/PyPDF2) e com fallback em CSV.
 
-import streamlit as st
-import pandas as pd
-import altair as alt
-import numpy as np
+import io
 import unicodedata
 from difflib import get_close_matches
 
-# === matplotlib só para a pizza (mantém layout antigo) ===
+import numpy as np
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+# --- matplotlib só para a pizza (idêntica ao seu código) ---
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_OK = True
 except ImportError:
     MATPLOTLIB_OK = False
 
-# === PDF readers (tentativas) ===
+# --- backends de PDF (qualquer um funciona) ---
 PDF_BACKEND = None
 try:
-    import pypdf  # moderno
+    import pypdf  # preferido
     PDF_BACKEND = "pypdf"
 except Exception:
     try:
@@ -38,31 +40,34 @@ def _norm(s: str) -> str:
     """normaliza texto (sem acento, minúsculo, só alfa-num/esp/-_/)."""
     s = unicodedata.normalize("NFD", str(s).lower())
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "-_/")
-    s = " ".join(s.split())
-    return s
+    return " ".join(s.split())
 
 def _tokens(s: str):
     return set(_norm(s).split())
+
+def _score_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 # ===========================
 # Sidebar: Manual (CSV + PDF)
 # ===========================
 st.sidebar.markdown("### 📘 Manual (opcional)")
 kb_file = st.sidebar.file_uploader(
-    "Suba o manual em **CSV/XLSX** (colunas: termo, conclusao, solucoes)",
-    type=["csv", "xlsx"],
-    key="kb"
+    "Suba manual **CSV/XLSX** (colunas: termo, conclusao, solucoes)",
+    type=["csv", "xlsx"], key="kb"
 )
 pdf_files = st.sidebar.file_uploader(
     "Ou suba **um ou mais PDFs** do manual",
-    type=["pdf"],
-    key="pdfs",
-    accept_multiple_files=True
+    type=["pdf"], key="pdfs", accept_multiple_files=True
 )
-usar_pdf = st.sidebar.toggle("🔎 Usar manual em PDF com prioridade", value=True, help="Se ligado, a IA busca soluções direto do(s) PDF(s). Se não achar, cai no CSV/fallback.")
+usar_pdf = st.sidebar.toggle("🔎 Usar manual em PDF com prioridade", value=True,
+                             help="Se ligado, a IA busca soluções direto do(s) PDF(s).")
+st.sidebar.caption(f"PDF backend: {PDF_BACKEND or 'nenhum'}")
 
 # ===========================
-# Carregamento do CSV manual
+# Carregar CSV do manual
 # ===========================
 @st.cache_data
 def load_kb(file):
@@ -75,6 +80,7 @@ def load_kb(file):
             df = pd.read_csv(file, sep=None, engine="python")
         except Exception:
             df = pd.read_csv(file)
+    # normaliza colunas
     cols = {c.strip().lower(): c for c in df.columns}
     rename = {}
     for need in ["termo", "conclusao", "solucoes"]:
@@ -85,9 +91,10 @@ def load_kb(file):
         if need not in df.columns:
             df[need] = ""
     df["termo_norm"] = df["termo"].map(_norm)
-    df["tokens"] = df["termo"].map(_tokens)
+    df["tokens"] = df["termo"].map(lambda s: _tokens(str(s)))
     return df[["termo", "termo_norm", "tokens", "conclusao", "solucoes"]]
 
+# Fallback embutido
 KB_DEFAULT = pd.DataFrame([
     {"termo": "LOW_PRESSURE", "conclusao": "Pressão baixa no circuito de tinta/jet.",
      "solucoes": "Verificar nível de solvente;Checar mangueiras e engates;Executar rotina de pressurização;Inspecionar vazamentos;Testar transdutor/bomba"},
@@ -101,12 +108,13 @@ KB_DEFAULT = pd.DataFrame([
      "solucoes": "Ajustar velocidade/atraso;Checar tinta/solvente;Limpar bico/eletrodos;Revisar distância cabeça-produto"},
 ])
 KB_DEFAULT["termo_norm"] = KB_DEFAULT["termo"].map(_norm)
-KB_DEFAULT["tokens"] = KB_DEFAULT["termo"].map(_tokens)
+KB_DEFAULT["tokens"] = KB_DEFAULT["termo"].map(lambda s: _tokens(str(s)))
 
 kb_user = load_kb(kb_file)
 KB_ALL = (pd.concat([kb_user, KB_DEFAULT], ignore_index=True)
           if not kb_user.empty else KB_DEFAULT)
 
+# Aliases para casar nomes
 ALIASES = {
     "falha de jato": "nozzle clog / entupimento de bico",
     "cabeçote sujo": "cabeçote requer limpeza ao desligar",
@@ -116,111 +124,105 @@ ALIASES = {
 ALIASES_NORM = { _norm(k): _norm(v) for k, v in ALIASES.items() }
 
 # ===========================
-# PDF → texto por página
+# Ler PDFs em memória (texto por página)
 # ===========================
 @st.cache_data(show_spinner=False)
-def read_pdfs(files):
+def read_pdfs(files, backend: str):
     pages = []  # [{source, page, text}]
-    if not files:
+    if not files or backend is None:
         return pages
     for f in files:
         try:
-            if PDF_BACKEND == "pypdf":
-                reader = pypdf.PdfReader(f)
+            data = f.getvalue()  # bytes do upload
+            if backend == "pypdf":
+                reader = pypdf.PdfReader(io.BytesIO(data))
                 for i, p in enumerate(reader.pages, start=1):
                     txt = p.extract_text() or ""
                     pages.append({"source": f.name, "page": i, "text": txt})
-            elif PDF_BACKEND == "PyPDF2":
-                reader = PyPDF2.PdfReader(f)
+            elif backend == "PyPDF2":
+                reader = PyPDF2.PdfReader(io.BytesIO(data))
                 for i, p in enumerate(reader.pages, start=1):
                     txt = p.extract_text() or ""
                     pages.append({"source": f.name, "page": i, "text": txt})
         except Exception:
+            # ignora PDF problemático e segue
             continue
     return pages
 
-PDF_PAGES = read_pdfs(pdf_files)
+PDF_PAGES = read_pdfs(pdf_files, PDF_BACKEND)
 
-def _score_jaccard(a_tokens:set, b_tokens:set) -> float:
-    if not a_tokens or not b_tokens:
-        return 0.0
-    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
-
-def _extract_steps(text:str, max_lines=12):
-    """Puxa linhas com padrão de instrução ('-','•','·','*','1.','2.' ou verbos comuns)."""
+def _extract_steps(text: str, max_lines=12):
+    """Extrai passos tipo checklist do bloco de texto."""
     steps = []
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     verbs = ("verificar","checar","inspecionar","executar","limpar","ajustar",
              "substituir","alinhar","recolocar","testar","revisar","aguardar")
     for ln in lines:
         ln_l = _norm(ln)
-        if ln.startswith(("-", "•", "·", "*")) or ln[:2].isdigit() or any(ln_l.startswith(v) for v in verbs):
+        if (ln.startswith(("-", "•", "·", "*"))
+            or (len(ln) > 2 and ln[:2].isdigit() and ln[2:3] in ".-) ")
+            or any(ln_l.startswith(v) for v in verbs)):
             steps.append(ln.lstrip("-•·* ").strip())
         if len(steps) >= max_lines:
             break
-    # remova duplicadas curtas
-    uniq = []
-    seen = set()
+    # de-duplicar
+    uniq, seen = [], set()
     for s in steps:
-        key = _norm(s)
-        if key and key not in seen:
+        k = _norm(s)
+        if k and k not in seen:
             uniq.append(s)
-            seen.add(key)
+            seen.add(k)
     return uniq
 
-def kb_lookup_pdf(term:str):
-    """Busca termo nos PDFs. Retorna dict com conclusao, solucoes, fonte (arquivo/página)."""
+def kb_lookup_pdf(term: str):
+    """Busca termo nos PDFs → conclusão + passos + fonte (arquivo/página)."""
     if not PDF_PAGES:
         return None
     q_norm = _norm(term)
-    q_tok  = _tokens(term)
-
-    # 1) alias direto → re-busca
     q_norm = ALIASES_NORM.get(q_norm, q_norm)
     q_tok  = _tokens(q_norm)
 
-    # rankeia páginas por jaccard + presença bruta do termo
-    scored = []
+    ranked = []
     for p in PDF_PAGES:
-        txt = p["text"]
-        tnorm = _norm(txt)
-        tokens = _tokens(tnorm)
+        txt_norm = _norm(p["text"])
+        tokens = _tokens(txt_norm)
         s = _score_jaccard(q_tok, tokens)
-        if q_norm in tnorm:
-            s += 0.25  # boost se match literal
+        if q_norm in txt_norm:
+            s += 0.25  # boost por match literal
         if s > 0:
-            scored.append((s, p))
-    if not scored:
+            ranked.append((s, p))
+    if not ranked:
         return None
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = scored[0][1]
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best = ranked[0][1]
 
-    # conclusão = primeira linha próxima do termo (ou início da página)
+    # pega janela ao redor do termo (ou início da página)
     text = best["text"]
     tnorm = _norm(text)
     pos = tnorm.find(q_norm) if q_norm in tnorm else 0
-    window = text[max(0, pos-300): pos+800]  # pega bloco ao redor
-    # conclusão: a primeira sentença do bloco
-    concl = window.strip().splitlines()[0].strip()
-    if len(concl) < 8:  # muito curta? pega a próxima
-        for ln in window.splitlines():
-            if len(ln.strip()) > 8:
-                concl = ln.strip()
-                break
+    window = text[max(0, pos-300): pos+900]
 
+    # conclusão = 1ª linha informativa do bloco
+    concl = ""
+    for ln in window.splitlines():
+        if len(ln.strip()) > 8:
+            concl = ln.strip()
+            break
     steps = _extract_steps(window)
+
     return {
-        "conclusao": concl.strip(),
+        "conclusao": concl,
         "solucoes": steps,
-        "fonte": f"{best['source']} p.{best['page']}"
+        "fonte": f"{best['source']} p.{best['page']}",
     }
 
 def kb_lookup_csv(term: str, cutoff_close=0.65, cutoff_jacc=0.35):
+    """Busca no CSV (user + fallback)."""
     if KB_ALL.empty:
         return None
     term_norm = _norm(term)
 
-    # alias
+    # alias direto
     target_norm = ALIASES_NORM.get(term_norm, term_norm)
     hit = KB_ALL[KB_ALL["termo_norm"] == target_norm]
     if not hit.empty:
@@ -228,14 +230,14 @@ def kb_lookup_csv(term: str, cutoff_close=0.65, cutoff_jacc=0.35):
         sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
         return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": "manual CSV/alias"}
 
-    # close-match
+    # similaridade (difflib)
     cand = get_close_matches(term_norm, KB_ALL["termo_norm"].tolist(), n=1, cutoff=cutoff_close)
     if cand:
         row = KB_ALL.loc[KB_ALL["termo_norm"] == cand[0]].iloc[0]
         sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
         return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": "manual CSV/fuzzy"}
 
-    # jaccard
+    # jaccard por tokens
     tA = _tokens(term_norm)
     if tA:
         jacc = KB_ALL["tokens"].apply(lambda tB: _score_jaccard(tA, tB))
@@ -246,31 +248,30 @@ def kb_lookup_csv(term: str, cutoff_close=0.65, cutoff_jacc=0.35):
             return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": f"manual CSV/jaccard {jacc.iloc[idx]:.2f}"}
     return None
 
-def kb_lookup(term: str):
-    """Resolução final: PDF (se habilitado e disponível) → CSV → fallback embutido."""
-    if usar_pdf and PDF_PAGES and PDF_BACKEND is not None:
+def kb_lookup(term: str, prefer_pdf: bool = True):
+    """PDF → CSV; retorna dict {'conclusao','solucoes','fonte'} ou None."""
+    if prefer_pdf and PDF_PAGES and PDF_BACKEND is not None:
         hit = kb_lookup_pdf(term)
         if hit and (hit["conclusao"] or hit["solucoes"]):
             return hit
-    # Cai para CSV/fallback
     return kb_lookup_csv(term)
 
 # ===========================
-# Leitura da planilha
+# Leitura da planilha do usuário
 # ===========================
-uploaded_file = st.file_uploader("📂 Suba sua planilha (.xlsx ou .csv)", type=["xlsx", "csv"])
-
 def read_any(file):
     if file.name.lower().endswith(".xlsx"):
         xls = pd.ExcelFile(file)
-        aba = st.selectbox("📑 Escolha a aba", xls.sheet_names)
-        df = pd.read_excel(xls, sheet_name=aba)
+        sheet = st.selectbox("📑 Escolha a aba", xls.sheet_names)
+        df = pd.read_excel(xls, sheet_name=sheet)
     else:
         try:
             df = pd.read_csv(file, sep=None, engine="python")
         except Exception:
             df = pd.read_csv(file)
     return df
+
+uploaded_file = st.file_uploader("📂 Suba sua planilha (.xlsx ou .csv)", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     try:
@@ -283,12 +284,13 @@ if uploaded_file is not None:
         st.write("📋 Colunas detectadas:", cols)
 
         # ==============================
-        # Relação categórica (igual à sua)
+        # Relação entre duas colunas categóricas
         # ==============================
         st.subheader("📊 Relação entre duas colunas categóricas")
         col_a = st.selectbox("👉 Primeira coluna categórica", cols, key="cata")
         col_b = st.selectbox("👉 Segunda coluna categórica", cols, key="catb")
 
+        # Qual coluna consultar no manual? (padrão a segunda — defeito/causa)
         coluna_manual = st.radio("Consultar manual usando qual coluna?",
                                  [col_b, col_a], index=0, horizontal=True)
 
@@ -307,7 +309,7 @@ if uploaded_file is not None:
                 )
 
                 if not relacao.empty:
-                    # Barras (Altair) — sem "value/color"
+                    # --- BARRAS (Altair) ---
                     chart = (
                         alt.Chart(relacao)
                            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
@@ -328,37 +330,26 @@ if uploaded_file is not None:
                     )
                     st.altair_chart(chart, use_container_width=True)
 
-                    # Pizza (igual ao seu original)
+                    # --- PIZZA (igual ao seu código original) ---
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
-                        dist = df[col_b].value_counts(normalize=True) * 100  # porcentagem
+                        dist = df[col_b].value_counts(normalize=True) * 100
                         dist = dist.sort_values(ascending=False)
-
-                        # Agrupar categorias pequenas (<5%)
                         outros = dist[dist < 5].sum()
                         dist = dist[dist >= 5]
                         if outros > 0:
                             dist["Outros"] = outros
-
                         fig, ax = plt.subplots(figsize=(7, 6))
                         wedges, texts, autotexts = ax.pie(
-                            dist,
-                            autopct="%1.1f%%",
-                            startangle=90,
-                            counterclock=False,
-                            colors=plt.cm.tab20.colors
+                            dist, autopct="%1.1f%%", startangle=90,
+                            counterclock=False, colors=plt.cm.tab20.colors
                         )
-                        ax.legend(
-                            wedges,
-                            dist.index,
-                            title=f"{col_b}",
-                            loc="center left",
-                            bbox_to_anchor=(1, 0, 0.5, 1)
-                        )
+                        ax.legend(wedges, dist.index, title=f"{col_b}",
+                                  loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
                         ax.set_title(f"Distribuição de {col_b}", fontsize=14)
                         st.pyplot(fig)
 
-                    # Diagnóstico original
+                    # --- DIAGNÓSTICO ORIGINAL ---
                     top = relacao.sort_values("QTD", ascending=False).iloc[0]
                     diag = (
                         f"⚠️ Diagnóstico Preventivo:\n\n"
@@ -368,16 +359,13 @@ if uploaded_file is not None:
                     )
                     st.success(diag)
 
-                    # IA do Manual (PDF prioritário)
+                    # --- IA do Manual (PDF prioritário) ---
                     termo_para_consulta = str(top[coluna_manual])
-                    kb_res = kb_lookup(termo_para_consulta)
+                    kb_res = kb_lookup(termo_para_consulta, prefer_pdf=usar_pdf)
 
                     with st.expander("🧠 Conclusão automática (Manual)", expanded=True):
                         if kb_res:
-                            if usar_pdf and PDF_PAGES and PDF_BACKEND is not None and "p." in kb_res["fonte"]:
-                                st.markdown(f"**Conclusão (do PDF):** {kb_res['conclusao']}")
-                            else:
-                                st.markdown(f"**Conclusão:** {kb_res['conclusao']}")
+                            st.markdown(f"**Conclusão:** {kb_res['conclusao']}")
                             if kb_res["solucoes"]:
                                 st.markdown("**Possíveis soluções:**")
                                 st.markdown("\n".join([f"- {s}" for s in kb_res["solucoes"]]))
@@ -385,7 +373,7 @@ if uploaded_file is not None:
                         else:
                             msg = "Não encontrei no PDF nem no CSV. Suba manual/CSV com colunas **termo, conclusao, solucoes**."
                             if usar_pdf and PDF_BACKEND is None and pdf_files:
-                                msg = "Biblioteca de PDF não disponível. Adicione `pypdf` ao requirements."
+                                msg = "Biblioteca de PDF não disponível. Adicione `pypdf` (ou `PyPDF2`) ao requirements e reimplante."
                             st.info(msg)
                 else:
                     st.warning("⚠️ Não há dados suficientes para gerar a relação.")
@@ -401,7 +389,6 @@ if uploaded_file is not None:
                 with pd.ExcelWriter(saida, engine="xlsxwriter") as writer:
                     wb = writer.book
                     df.to_excel(writer, sheet_name="Base", index=False)
-
                     if relacao is not None:
                         relacao.to_excel(writer, sheet_name="Relação", index=False)
                         ws = writer.sheets["Relação"]
@@ -416,7 +403,6 @@ if uploaded_file is not None:
                         if diag:
                             ws.write(len(relacao) + 3, 0, "Diagnóstico Preventivo:")
                             ws.write(len(relacao) + 4, 0, diag)
-
                 with open(saida, "rb") as f:
                     st.download_button("⬇️ Baixar Relatório", f, file_name=saida)
             except Exception as e:
