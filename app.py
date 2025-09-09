@@ -1,36 +1,38 @@
+# app.py — Analisador Dinâmico de Planilhas (pizza original + IA do manual)
+
 import streamlit as st
 import pandas as pd
-
-# NOVO: Altair pra barras sem "value/color"
 import altair as alt
+import numpy as np
+import unicodedata
+from difflib import get_close_matches
 
-# Import matplotlib com fallback (pizza continua igual)
+# Pizza com matplotlib (mantida igual)
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_OK = True
 except ImportError:
     MATPLOTLIB_OK = False
 
-from difflib import get_close_matches
-
 st.set_page_config(page_title="Analisador Dinâmico de Planilhas", layout="wide")
 st.title("📊 Analisador Dinâmico de Planilhas")
 
-# ------------------ IA: Manual ------------------
-st.sidebar.markdown("### 📘 Manual (opcional)")
-kb_file = st.sidebar.file_uploader("Suba o manual (CSV ou XLSX) com colunas: termo, conclusao, solucoes",
-                                   type=["csv", "xlsx"], key="kb")
-
+# ===========================
+# Helpers de normalização (IA)
+# ===========================
 def _norm(s: str) -> str:
-    s = str(s).lower()
-    keep = []
-    for ch in s:
-        if ch.isalnum() or ch.isspace() or ch in "-_/":
-            keep.append(ch)
-    return "".join(keep).strip()
+    """normaliza texto (sem acento, minúsculo, só alfa-num/esp/-_/)."""
+    s = unicodedata.normalize("NFD", str(s).lower())
+    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "-_/")
+    s = " ".join(s.split())
+    return s
+
+def _tokens(s: str):
+    return set(_norm(s).split())
 
 @st.cache_data
 def load_kb(file):
+    """carrega manual CSV/XLSX com colunas: termo, conclusao, solucoes"""
     if not file:
         return pd.DataFrame()
     if file.name.lower().endswith(".xlsx"):
@@ -40,53 +42,92 @@ def load_kb(file):
             df = pd.read_csv(file, sep=None, engine="python")
         except Exception:
             df = pd.read_csv(file)
-    # normaliza nomes de colunas esperados
     cols = {c.strip().lower(): c for c in df.columns}
     rename = {}
-    if "termo" in cols: rename[cols["termo"]] = "termo"
-    if "conclusao" in cols: rename[cols["conclusao"]] = "conclusao"
-    if "solucoes" in cols: rename[cols["solucoes"]] = "solucoes"
+    for need in ["termo", "conclusao", "solucoes"]:
+        if need in cols:
+            rename[cols[need]] = need
     df = df.rename(columns=rename)
     for need in ["termo", "conclusao", "solucoes"]:
         if need not in df.columns:
             df[need] = ""
     df["termo_norm"] = df["termo"].map(_norm)
-    return df[["termo", "termo_norm", "conclusao", "solucoes"]]
+    df["tokens"] = df["termo"].map(_tokens)
+    return df[["termo", "termo_norm", "tokens", "conclusao", "solucoes"]]
 
-# Base embutida (fallback) — edite à vontade depois
+# ===== KB fallback embutido (edite/expanda à vontade) =====
 KB_DEFAULT = pd.DataFrame([
     {"termo": "LOW_PRESSURE", "conclusao": "Pressão baixa no circuito de tinta/jet.",
-     "solucoes": "Verificar nível de solvente;Checar mangueiras e engates;Executar rotina de pressurização;Inspecionar vazamentos;Reiniciar bomba/recirculação"},
-    {"termo": "ALTA VISCOSIDADE", "conclusao": "Viscosidade de tinta acima da janela.",
-     "solucoes": "Checar make-up/solvente;Executar rotina de diluição;Verificar sensor de viscosidade;Avaliar temperatura ambiente;Padronizar tampas e reabastecimento"},
-    {"termo": "NOZZLE CLOG / ENTUPIMENTO DE BICO", "conclusao": "Bico/jet possivelmente obstruído.",
-     "solucoes": "Limpar cabeça de impressão;Aplicar flush conforme manual;Verificar filtro;Checar qualidade da tinta;Agendar limpeza preventiva"},
-    {"termo": "MISALIGNMENT / DESALINHADO", "conclusao": "Cabeça desalinhada em relação ao produto.",
-     "solucoes": "Ajustar distância/ângulo da cabeça;Fixar suportes;Testar impressão e leitura;Revisar gabarito/guia do produto"},
-    {"termo": "IMPRESSÃO CLARA / FADED", "conclusao": "Marcação com baixa densidade/contraste.",
-     "solucoes": "Checar velocidade vs. setpoint;Ajustar tensão/tempo de gota (conforme manual);Verificar tinta/solvente;Limpar bico e eletrodos;Revisar distância cabeça-produto"},
+     "solucoes": "Verificar nível de solvente;Checar mangueiras e engates;Executar rotina de pressurização;Inspecionar vazamentos;Testar transdutor/bomba"},
+    {"termo": "ALTA VISCOSIDADE", "conclusao": "Viscosidade acima da janela.",
+     "solucoes": "Checar make-up/solvente;Executar rotina de diluição;Verificar sensor de viscosidade;Ajustar temperatura ambiente"},
+    {"termo": "NOZZLE CLOG / ENTUPIMENTO DE BICO", "conclusao": "Bico/jato possivelmente obstruído.",
+     "solucoes": "Limpar cabeça de impressão;Aplicar flush;Trocar/limpar filtro;Checar qualidade da tinta;Agendar preventiva"},
+    {"termo": "MISALIGNMENT / DESALINHADO", "conclusao": "Cabeça desalinhada do produto.",
+     "solucoes": "Ajustar distância/ângulo;Fixar suportes;Revisar gabarito/guia;Testar leitura"},
+    {"termo": "IMPRESSÃO CLARA / FADED", "conclusao": "Baixa densidade/contraste de marcação.",
+     "solucoes": "Ajustar velocidade/atraso;Checar tinta/solvente;Limpar bico/eletrodos;Revisar distância cabeça-produto"},
 ])
-
 KB_DEFAULT["termo_norm"] = KB_DEFAULT["termo"].map(_norm)
+KB_DEFAULT["tokens"] = KB_DEFAULT["termo"].map(_tokens)
 
+# ===== Sinônimos (alias) para casar melhor com sua planilha =====
+ALIASES = {
+    "falha de jato": "nozzle clog / entupimento de bico",
+    "cabeçote sujo": "cabeçote requer limpeza ao desligar",
+    "ausencia de impressao": "impressão clara / faded",
+    "perda de modulacao": "impressão clara / faded",
+}
+ALIASES_NORM = { _norm(k): _norm(v) for k, v in ALIASES.items() }
+
+# ===========================
+# Sidebar: upload do manual
+# ===========================
+st.sidebar.markdown("### 📘 Manual (opcional)")
+kb_file = st.sidebar.file_uploader(
+    "Suba o manual (CSV ou XLSX) com colunas: termo, conclusao, solucoes",
+    type=["csv", "xlsx"], key="kb"
+)
 kb_user = load_kb(kb_file)
-KB_ALL = kb_user if not kb_user.empty else KB_DEFAULT
+KB_ALL = (pd.concat([kb_user, KB_DEFAULT], ignore_index=True)
+          if not kb_user.empty else KB_DEFAULT)
 
-def kb_lookup(term: str, cutoff=0.78):
-    """Busca termo no manual (fuzzy). Retorna dict {conclusao, solucoes[]} ou None."""
+def kb_lookup(term: str, cutoff_close=0.65, cutoff_jacc=0.35):
+    """Busca termo no manual:
+       1) alias direto → 2) difflib close-match → 3) Jaccard por tokens."""
     if KB_ALL.empty:
         return None
     term_norm = _norm(term)
-    universe = KB_ALL["termo_norm"].tolist()
-    match = get_close_matches(term_norm, universe, n=1, cutoff=cutoff)
-    if not match:
-        return None
-    row = KB_ALL.loc[KB_ALL["termo_norm"] == match[0]].iloc[0]
-    sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
-    return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": ("manual" if not kb_user.empty else "embutido")}
 
-# ------------------------------------------------
+    # 1) alias
+    target_norm = ALIASES_NORM.get(term_norm, term_norm)
+    hit = KB_ALL[KB_ALL["termo_norm"] == target_norm]
+    if not hit.empty:
+        row = hit.iloc[0]
+        sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
+        return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": "manual/alias"}
 
+    # 2) difflib
+    cand = get_close_matches(term_norm, KB_ALL["termo_norm"].tolist(), n=1, cutoff=cutoff_close)
+    if cand:
+        row = KB_ALL.loc[KB_ALL["termo_norm"] == cand[0]].iloc[0]
+        sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
+        return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": "manual/fuzzy"}
+
+    # 3) jaccard por tokens
+    tA = _tokens(term_norm)
+    if tA:
+        jacc = KB_ALL["tokens"].apply(lambda tB: len(tA & tB) / len(tA | tB) if (tA | tB) else 0.0)
+        idx = int(jacc.idxmax())
+        if jacc.iloc[idx] >= cutoff_jacc:
+            row = KB_ALL.iloc[idx]
+            sols = [s.strip() for s in str(row["solucoes"]).split(";") if str(s).strip()]
+            return {"conclusao": str(row["conclusao"]).strip(), "solucoes": sols, "fonte": f"manual/jaccard {jacc.iloc[idx]:.2f}"}
+    return None
+
+# ===========================
+# Upload da planilha de dados
+# ===========================
 uploaded_file = st.file_uploader("📂 Suba sua planilha (.xlsx ou .csv)", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
@@ -108,7 +149,7 @@ if uploaded_file is not None:
                 st.stop()
 
         st.subheader("🔎 Pré-visualização")
-        st.dataframe(df.head())
+        st.dataframe(df.head(), use_container_width=True)
 
         cols = df.columns.tolist()
         st.write("📋 Colunas detectadas:", cols)
@@ -127,7 +168,7 @@ if uploaded_file is not None:
         relacao, diag = None, None
         try:
             if col_a and col_b:
-                # contagem (robusta a NaN)
+                # contagem robusta (mantém NaN como "—")
                 tmp = df[[col_a, col_b]].copy()
                 tmp[col_a] = tmp[col_a].astype(str).fillna("—")
                 tmp[col_b] = tmp[col_b].astype(str).fillna("—")
@@ -160,7 +201,7 @@ if uploaded_file is not None:
                     )
                     st.altair_chart(chart, use_container_width=True)
 
-                    # ---------- PIZZA (igual ao seu) ----------
+                    # ---------- PIZZA (idêntica ao seu código original) ----------
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
                         dist = df[col_b].value_counts(normalize=True) * 100  # porcentagem
@@ -180,6 +221,7 @@ if uploaded_file is not None:
                             counterclock=False,
                             colors=plt.cm.tab20.colors
                         )
+                        # Legenda fora do gráfico
                         ax.legend(
                             wedges,
                             dist.index,
@@ -190,7 +232,7 @@ if uploaded_file is not None:
                         ax.set_title(f"Distribuição de {col_b}", fontsize=14)
                         st.pyplot(fig)
 
-                    # ---------- DIAGNÓSTICO ORIGINAL ----------
+                    # ---------- DIAGNÓSTICO ORIGINAL (texto igual) ----------
                     top = relacao.sort_values("QTD", ascending=False).iloc[0]
                     diag = (
                         f"⚠️ Diagnóstico Preventivo:\n\n"
@@ -200,7 +242,7 @@ if uploaded_file is not None:
                     )
                     st.success(diag)
 
-                    # ---------- 🧠 IA (Manual) ----------
+                    # ---------- 🧠 Conclusão automática (Manual) ----------
                     termo_para_consulta = str(top[coluna_manual])
                     kb_res = kb_lookup(termo_para_consulta)
 
@@ -212,7 +254,15 @@ if uploaded_file is not None:
                                 st.markdown("\n".join([f"- {s}" for s in kb_res["solucoes"]]))
                             st.caption(f"Fonte: {kb_res['fonte']}")
                         else:
-                            st.info("Não encontrei esse item no manual. Suba um CSV/XLSX com colunas **termo, conclusao, solucoes** para recomendações específicas.")
+                            # sugestões de termos parecidos
+                            sugg = get_close_matches(_norm(termo_para_consulta),
+                                                     KB_ALL["termo_norm"].tolist(), n=5, cutoff=0.3)
+                            if sugg:
+                                nomes = [KB_ALL.loc[KB_ALL["termo_norm"] == s, "termo"].iloc[0] for s in sugg]
+                                st.info("Não encontrei esse item no manual. Termos parecidos:")
+                                st.write(" • " + "\n • ".join(nomes))
+                            else:
+                                st.info("Não encontrei esse item no manual. Suba um CSV/XLSX com colunas **termo, conclusao, solucoes** para recomendações específicas.")
                 else:
                     st.warning("⚠️ Não há dados suficientes para gerar a relação.")
         except Exception as e:
