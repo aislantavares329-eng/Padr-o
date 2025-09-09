@@ -1,12 +1,13 @@
 # app.py — Analisador Dinâmico de Planilhas
 # Barras (Altair), pizza (matplotlib), diagnóstico original,
 # IA do manual com PDF robusta (regex + heurística) + CSV fallback.
-# Filtros anti-tabela/cabeçalho p/ evitar "18 N/A..." e "Mesa Página".
+# Filtros anti-tabela/índice; plano de ação amarrado ao diagnóstico; modo 5W2H.
 
 import io
 import re
 import unicodedata
 from difflib import get_close_matches
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,27 @@ st.set_page_config(page_title="Analisador Dinâmico de Planilhas", layout="wide"
 st.title("📊 Analisador Dinâmico de Planilhas")
 
 # ===========================
+# Sidebar: Manual + Plano
+# ===========================
+st.sidebar.markdown("### 📘 Manual (opcional)")
+kb_file = st.sidebar.file_uploader(
+    "Suba manual **CSV/XLSX** (colunas: termo, conclusao, solucoes)",
+    type=["csv", "xlsx"], key="kb"
+)
+pdf_files = st.sidebar.file_uploader(
+    "Ou suba **um ou mais PDFs** do manual",
+    type=["pdf"], key="pdfs", accept_multiple_files=True
+)
+usar_pdf = st.sidebar.toggle("🔎 Usar manual em PDF com prioridade", value=True)
+st.sidebar.caption(f"PDF backend: {PDF_BACKEND or 'nenhum'}")
+
+st.sidebar.markdown("### 🧰 Plano de ação")
+modo_5w2h = st.sidebar.toggle("📋 Modo 5W2H", value=False)
+responsavel_padrao = st.sidebar.text_input("Responsável padrão", "Manutenção")
+prazo_dias = st.sidebar.number_input("Prazo (dias)", min_value=1, max_value=60, value=7, step=1)
+custo_padrao = st.sidebar.text_input("Custo (estimado)", "—")
+
+# ===========================
 # Normalização / tokens
 # ===========================
 def _norm(s: str) -> str:
@@ -50,21 +72,6 @@ def _score_jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
-
-# ===========================
-# Sidebar: Manual (CSV + PDF)
-# ===========================
-st.sidebar.markdown("### 📘 Manual (opcional)")
-kb_file = st.sidebar.file_uploader(
-    "Suba manual **CSV/XLSX** (colunas: termo, conclusao, solucoes)",
-    type=["csv", "xlsx"], key="kb"
-)
-pdf_files = st.sidebar.file_uploader(
-    "Ou suba **um ou mais PDFs** do manual",
-    type=["pdf"], key="pdfs", accept_multiple_files=True
-)
-usar_pdf = st.sidebar.toggle("🔎 Usar manual em PDF com prioridade", value=True)
-st.sidebar.caption(f"PDF backend: {PDF_BACKEND or 'nenhum'}")
 
 # ===========================
 # Carregar CSV do manual
@@ -154,34 +161,47 @@ def read_pdfs(files, backend):
 PDF_PAGES = read_pdfs(pdf_files, PDF_BACKEND)
 
 # ===========================
-# Helpers anti-tabela/cabeçalho
+# Helpers anti-índice/tabela/cabeçalho
 # ===========================
 _BAD_WORDS = {"página","pagina","page","tabela","table","índice","indice",
               "sumário","sumario","conteúdo","conteudo","seção","secao",
               "capítulo","capitulo","manual"}
 
+def _looks_like_toc_entry(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    # …… 228 | …… 5—228 | ...... 79 | texto ....... 228
+    if re.search(r"\.{2,}\s*\d+(\s*[–—-]\s*\d+)?$", s):
+        return True
+    if re.search(r"[\.·\s]{3,}\d+(\s*[–—-]\s*\d+)?$", s):
+        return True
+    if re.search(r"\b(se[cç][aã]o|section|cap[ií]tulo|chapter)\b.*\d+\s*[–—-]\s*\d+$", s, re.I):
+        return True
+    return False
+
 def _looks_like_table_line(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
-    # linhas com muitos dígitos ou N/A repetido
+    # linhas com quase só dígitos/NA/pontuação
     if re.fullmatch(r"(?:[\d\.\-\/\s]|N/?A)+", s, flags=re.I):
         return True
-    # 3+ blocos de números separados por espaço → grade/coluna
+    # 3+ blocos numéricos seguidos (grade)
     if re.search(r"(?:\d[\d\./-]*\s+){3,}\d[\d\./-]*", s):
         return True
-    # maioria de abreviações maiúsculas curtas
+    # abreviações maiúsculas curtas dominantes
     tokens = s.split()
     if tokens and sum(t.isupper() and len(t) <= 4 for t in tokens) / len(tokens) > 0.7:
         return True
     return False
 
 def _is_texty(s: str) -> bool:
-    """True se parece frase 'normal' (não tabela/cabeçalho/numérica)."""
+    """True se parece frase normal (não tabela/cabeçalho/TOC/numérica)."""
     s = (s or "").strip()
     if not s or len(s) < 8:
         return False
-    if _looks_like_table_line(s):
+    if _looks_like_toc_entry(s) or _looks_like_table_line(s):
         return False
     sn = s.lower()
     if any(w in sn for w in _BAD_WORDS):
@@ -197,11 +217,13 @@ def _is_texty(s: str) -> bool:
     return True
 
 def _first_informative_line(block: str) -> str:
-    """Escolhe linha boa p/ conclusão; prioriza frases com palavras-chave."""
+    """Escolhe linha boa p/ conclusão; pula TOC/cabeçalho e prioriza palavras-chave."""
     KEYS = ("causa","cause","sintoma","symptom","descrição","description",
             "ação","acao","procedimento","solução","solucao","falha","fault",
             "avaria","problem","issue")
-    lines = [ln.strip() for ln in (block or "").splitlines() if _is_texty(ln)]
+    lines_all = [ln.strip() for ln in (block or "").splitlines()]
+    # limpa tudo que for TOC/tabela/cabeçalho
+    lines = [ln for ln in lines_all if _is_texty(ln)]
     if not lines:
         return ""
     for ln in lines:
@@ -366,9 +388,8 @@ def kb_lookup_pdf_regex(term: str):
         start = max(0, (mpos if mpos is not None else 0) - 400)
         window = txt[start:start+1500]
 
-        # filtra linhas óbvias de cabeçalho/tabela já na janela
-        lines = [ln for ln in window.splitlines() if _is_texty(ln)]
-        window = "\n".join(lines)
+        # limpa linhas de TOC/tabela/cabeçalho ANTES de selecionar conclusão e passos
+        window = "\n".join(ln for ln in window.splitlines() if _is_texty(ln))
 
         if not concl:
             concl = _first_informative_line(window)
@@ -494,6 +515,115 @@ def kb_lookup(term: str, prefer_pdf=True):
     return kb_lookup_csv(term)
 
 # ===========================
+# Ações baseadas no diagnóstico (combinação col_a x col_b) + 5W2H
+# ===========================
+CONTEXT_FALLBACKS = {
+    "surto de tensao": [
+        "Instalar/disponibilizar DPS (classe II) no quadro da linha e no ponto da impressora {ASSET}",
+        "Verificar aterramento (< 10 Ω) e equipotencialização do chassi/cabeçote da {ASSET}",
+        "Colocar a impressora em UPS on-line (tempo de autonomia compatível com paradas)",
+        "Inspecionar cabos de alimentação, borneiras e reaperto de conexões; procurar marcas de arco",
+        "Checar fonte de alimentação/PSU e eletrônica associada após evento de pico; executar autotestes",
+        "Revisar qualidade da rede (medição de surtos/harmônicos por 72h) e acionar manutenção elétrica"
+    ],
+    "baixa pressao": [
+        "Checar nível de solvente/tinta e pressurizar o circuito",
+        "Inspecionar mangueiras/engates por vazamento ou dobra",
+        "Substituir filtro principal/linha se houver restrição de fluxo",
+        "Testar transdutor de pressão e bomba (elétrica e mecânica)",
+        "Verificar manifold/tubulação e limpeza do circuito"
+    ],
+    "viscosidade": [
+        "Conferir make-up/solvente e executar rotina de diluição",
+        "Verificar sensor de viscosidade/temperatura",
+        "Ajustar temperatura ambiente e condições do processo",
+        "Não adicionar solvente manualmente quando a impressora sinalizar medições corretas"
+    ],
+    "cabeçote requer limpeza": [
+        "Executar procedimento de limpeza de cabeçote conforme manual",
+        "Inspecionar bico/eletrodos e distância cabeça–produto",
+        "Implementar rotina de limpeza ao desligar (padronização de turno)"
+    ],
+    "tof": [
+        "Verificar estabilidade do jato e da modulação",
+        "Ajustar posição/ângulo do cabeçote e checar TOF",
+        "Corrigir condições de viscosidade/temperatura"
+    ],
+}
+
+def _pick_fallback(defect_norm: str) -> list[str]:
+    for key in CONTEXT_FALLBACKS.keys():
+        if key in defect_norm:
+            return CONTEXT_FALLBACKS[key]
+    # alias rápidos
+    if "tempo de voo" in defect_norm or "tof" in defect_norm:
+        return CONTEXT_FALLBACKS["tof"]
+    if "cabeçote" in defect_norm and "limpeza" in defect_norm:
+        return CONTEXT_FALLBACKS["cabeçote requer limpeza"]
+    return []
+
+def build_actions_from_diagnostic(top_row, col_a, col_b, kb_res,
+                                  resp_padrao="Manutenção", prazo=7, custo="—",
+                                  modo_5w2h=False):
+    """Gera plano contextual usando (col_a x col_b) + manual (ou fallback).
+       Se modo_5w2h=True, retorna DataFrame 5W2H; senão, markdown."""
+    asset  = str(top_row[col_a])
+    defect = str(top_row[col_b])
+    occ    = int(top_row["QTD"])
+    defect_norm = _norm(defect)
+
+    # 1) passos do manual, se houver
+    steps = []
+    fonte = ""
+    if kb_res and kb_res.get("solucoes"):
+        steps = list(kb_res["solucoes"])
+        fonte = kb_res.get("fonte", "")
+
+    # 2) senão, fallback pelo tipo de defeito
+    if not steps:
+        steps = _pick_fallback(defect_norm)
+
+    # personaliza com o ativo/linha
+    steps = [s.replace("{ASSET}", asset) for s in steps]
+
+    if not modo_5w2h:
+        # plano em markdown
+        plano = []
+        plano.append(f"**Contexto:** `{asset} x {defect}` — **{occ}** ocorrências (janela analisada).")
+        if kb_res and kb_res.get("conclusao"):
+            plano.append(f"**Conclusão (manual):** {kb_res['conclusao']}")
+        if steps:
+            plano.append("**Ações prioritárias:**")
+            plano.extend([f"- {s}" for s in steps[:8]])
+        else:
+            plano.append("**Ações prioritárias:** (não encontradas no manual/fallback)")
+        plano.append("**Checklist de execução (rápido):** responsável definido • prazo curto • evidência (foto/log) • reteste pós-ação • registrar ocorrência")
+        if fonte:
+            plano.append(f"*Fonte:* {fonte}")
+        return "\n\n".join(plano)
+
+    # 5W2H
+    deadline = (datetime.today() + timedelta(days=prazo)).strftime("%Y-%m-%d")
+    rows = []
+    why = f"Reduzir recorrência de **{defect}** no ativo **{asset}** ({occ} ocorrências)"
+    how_src = "Manual/CSV" if kb_res else "Boas práticas (fallback)"
+    for s in steps[:10] if steps else ["—"]:
+        rows.append({
+            "What (o quê)": s,
+            "Why (por quê)": why,
+            "Where (onde)": asset,
+            "Who (quem)": resp_padrao,
+            "When (quando)": deadline,
+            "How (como)": how_src,
+            "How much (quanto)": custo,
+        })
+    df5w2h = pd.DataFrame(rows)
+    if fonte:
+        # adiciona fonte como nota (mostrar abaixo da tabela)
+        df5w2h.attrs["fonte"] = fonte
+    return df5w2h
+
+# ===========================
 # Leitura da planilha do usuário
 # ===========================
 def read_any(file):
@@ -570,7 +700,7 @@ if uploaded_file is not None:
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
                         dist = df[col_b].value_counts(normalize=True) * 100
-                        dist = dist.sort_values(ascending=True)  # opcional: ordena crescente p/ legenda melhor
+                        dist = dist.sort_values(ascending=False)
                         outros = dist[dist < 5].sum()
                         dist = dist[dist >= 5]
                         if outros > 0:
@@ -599,18 +729,29 @@ if uploaded_file is not None:
                     termo_para_consulta = str(top[coluna_manual])
                     kb_res = kb_lookup(termo_para_consulta, prefer_pdf=usar_pdf)
 
-                    with st.expander("🧠 Conclusão automática (Manual)", expanded=True):
-                        if kb_res:
-                            st.markdown(f"**Conclusão:** {kb_res['conclusao'] or '—'}")
-                            if kb_res["solucoes"]:
-                                st.markdown("**Possíveis soluções:**")
-                                st.markdown("\n".join([f"- {s}" for s in kb_res["solucoes"]]))
-                            st.caption(f"Fonte: {kb_res['fonte']}")
+                    # --- Plano amarrado ao diagnóstico (Markdown ou 5W2H) ---
+                    with st.expander("🧠 Conclusão & Plano (baseado no diagnóstico)", expanded=True):
+                        plano = build_actions_from_diagnostic(
+                            top, col_a, col_b, kb_res,
+                            resp_padrao=responsavel_padrao,
+                            prazo=prazo_dias,
+                            custo=custo_padrao,
+                            modo_5w2h=modo_5w2h
+                        )
+                        if modo_5w2h:
+                            st.dataframe(plano, use_container_width=True)
+                            if hasattr(plano, "attrs") and "fonte" in plano.attrs and plano.attrs["fonte"]:
+                                st.caption(f"Fonte: {plano.attrs['fonte']}")
+                            # download CSV do 5W2H
+                            csv = plano.to_csv(index=False).encode("utf-8")
+                            st.download_button("⬇️ Baixar 5W2H (CSV)", csv, file_name="plano_5w2h.csv")
                         else:
-                            msg = "Não encontrei no PDF nem no CSV. Suba manual/CSV com colunas **termo, conclusao, solucoes**."
-                            if usar_pdf and PDF_BACKEND is None and pdf_files:
-                                msg = "Biblioteca de PDF não disponível. Adicione `pypdf` (ou `PyPDF2`) ao requirements e reimplante."
-                            st.info(msg)
+                            st.markdown(plano)
+
+                        # mostra fonte do manual se não estiver no 5W2H
+                        if (not modo_5w2h) and kb_res and kb_res.get("fonte"):
+                            st.caption(f"Fonte: {kb_res['fonte']}")
+
                 else:
                     st.warning("⚠️ Não há dados suficientes para gerar a relação.")
         except Exception as e:
