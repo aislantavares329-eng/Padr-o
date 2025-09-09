@@ -1,7 +1,7 @@
 # app.py — Analisador Dinâmico de Planilhas
 # Barras (Altair), pizza (matplotlib), diagnóstico original,
 # IA do manual com PDF robusta (regex + heurística) + CSV fallback.
-# Filtro anti-tabela/numérico nos passos (nada de "10 12 24...").
+# Filtros anti-tabela/cabeçalho p/ evitar "18 N/A..." e "Mesa Página".
 
 import io
 import re
@@ -154,45 +154,75 @@ def read_pdfs(files, backend):
 PDF_PAGES = read_pdfs(pdf_files, PDF_BACKEND)
 
 # ===========================
-# Heurísticas de qualidade de texto
+# Helpers anti-tabela/cabeçalho
 # ===========================
-def _is_texty(s: str) -> bool:
-    """True se a linha parece texto (não números/tabela)."""
+_BAD_WORDS = {"página","pagina","page","tabela","table","índice","indice",
+              "sumário","sumario","conteúdo","conteudo","seção","secao",
+              "capítulo","capitulo","manual"}
+
+def _looks_like_table_line(s: str) -> bool:
     s = (s or "").strip()
-    if not s or len(s) < 6:
+    if not s:
         return False
-    if s.upper() in {"N/A", "NA"}:
+    # linhas com muitos dígitos ou N/A repetido
+    if re.fullmatch(r"(?:[\d\.\-\/\s]|N/?A)+", s, flags=re.I):
+        return True
+    # 3+ blocos de números separados por espaço → grade/coluna
+    if re.search(r"(?:\d[\d\./-]*\s+){3,}\d[\d\./-]*", s):
+        return True
+    # maioria de abreviações maiúsculas curtas
+    tokens = s.split()
+    if tokens and sum(t.isupper() and len(t) <= 4 for t in tokens) / len(tokens) > 0.7:
+        return True
+    return False
+
+def _is_texty(s: str) -> bool:
+    """True se parece frase 'normal' (não tabela/cabeçalho/numérica)."""
+    s = (s or "").strip()
+    if not s or len(s) < 8:
         return False
-    # só dígitos/pontuação?
-    if re.fullmatch(r"[\d\s\.\-\/:]+", s):
+    if _looks_like_table_line(s):
         return False
+    sn = s.lower()
+    if any(w in sn for w in _BAD_WORDS):
+        return False
+    # proporção de letras vs dígitos
     letters = sum(ch.isalpha() for ch in s)
-    digits  = sum(ch.isdigit() for ch in s)
-    if digits > letters:  # mais números que letras = provavelmente tabela
+    digits  = sum(ch.isdigit()  for ch in s)
+    if digits > letters * 0.6:
+        return False
+    # precisa ter pelo menos 2 palavras com letras
+    if sum(1 for t in s.split() if any(c.isalpha() for c in t)) < 2:
         return False
     return True
 
 def _first_informative_line(block: str) -> str:
-    """Pega linha 'boa' para conclusão; evita cabeçalhos e números."""
+    """Escolhe linha boa p/ conclusão; prioriza frases com palavras-chave."""
     KEYS = ("causa","cause","sintoma","symptom","descrição","description",
-            "falha","fault","avaria","problem","issue","overview")
+            "ação","acao","procedimento","solução","solucao","falha","fault",
+            "avaria","problem","issue")
     lines = [ln.strip() for ln in (block or "").splitlines() if _is_texty(ln)]
     if not lines:
         return ""
     for ln in lines:
         if any(k in _norm(ln) for k in KEYS):
             return ln
+    for ln in lines:
+        if len(ln) >= 20 and re.search(r"[\.:\-;]", ln):
+            return ln
     return lines[0]
 
 def _extract_steps(text: str, max_lines: int = 12) -> list:
-    """Extrai passos de ação; filtra numéricos e exige bullet/verbos."""
+    """Extrai passos práticos; exige bullet/numeração/verbos e barra linhas numéricas."""
     VERBS = ("verificar","checar","inspecionar","executar","limpar","ajustar",
              "substituir","alinhar","recolocar","testar","revisar","aguardar",
              "apertar","conferir","drenar","pressurizar","desobstruir")
     steps = []
-    for ln in (text or "").splitlines():
-        raw = ln.strip()
-        if not _is_texty(raw):
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        if not raw or not _is_texty(raw):
+            continue
+        if _looks_like_table_line(raw):
             continue
         ln_norm = _norm(raw)
         is_bullet = raw.startswith(("-", "•", "·", "*")) or (
@@ -201,7 +231,7 @@ def _extract_steps(text: str, max_lines: int = 12) -> list:
         has_verb = any(ln_norm.startswith(v) or f" {v} " in ln_norm for v in VERBS)
         if is_bullet or has_verb:
             clean = raw.lstrip("-•·* ").strip()
-            if len(clean) >= 8:
+            if len(clean) >= 10:
                 steps.append(clean)
         if len(steps) >= max_lines:
             break
@@ -217,27 +247,27 @@ def _extract_steps(text: str, max_lines: int = 12) -> list:
 # ===========================
 # Mapeamento por REGEX → seções do manual
 # ===========================
-# Cada entrada define: "chaves" (para similaridade) e "padroes" (o que procurar no PDF)
+# Cada entrada define: "keys" (para similaridade) e "patterns" (o que procurar no PDF)
 MANUAL_CODES = {
     "3.18 Baixa pressão": {
         "keys": "baixa pressão low pressure pressao baixa fc006",
-        "patterns": [r"\b3\.18\b", r"\blow[\s\-]?pressure\b", r"\bbaixa\s+press(ão|ao)\b", r"\bFC006\b"],
+        "patterns": [r"\b3\.18\b.*baix[ao]\s+press", r"\blow[\s\-]?pressure\b", r"\bFC0?06\b"],
     },
     "3.28 Cabeçote requer limpeza ao desligar": {
         "keys": "cabeçote limpeza head clean shutdown",
-        "patterns": [r"\b3\.28\b", r"\bcabe(ç|c)ote.*limpez", r"\bhead.*clean", r"\bclean.*head"],
+        "patterns": [r"\b3\.28\b.*cabe(ç|c)ote.*limpez", r"\b(head|printhead).*(clean|cleaning)"],
     },
     "3.20 Sem Tempo de Voo (TOF)": {
         "keys": "sem tof no tof tempo de voo time of flight",
-        "patterns": [r"\b3\.20\b", r"\btempo\s+de\s+voo\b", r"\btime\s+of\s+flight\b", r"\bTOF\b"],
+        "patterns": [r"\b3\.20\b.*(tempo\s+de\s+voo|time\s+of\s+flight|TOF)"],
     },
     "2.12 Viscosidade": {
         "keys": "viscosidade viscosity 2.12",
-        "patterns": [r"\b2\.12\b", r"\bviscosidad", r"\bviscosit"],
+        "patterns": [r"\b2\.12\b.*viscos", r"\bviscosit"],
     },
     "2.03 Tempo de Voo": {
         "keys": "tempo de voo time of flight 2.03",
-        "patterns": [r"\b2\.03\b", r"\btempo\s+de\s+voo\b", r"\btime\s+of\s+flight\b"],
+        "patterns": [r"\b2\.03\b.*(tempo\s+de\s+voo|time\s+of\s+flight)"],
     },
 }
 
@@ -300,7 +330,7 @@ def kb_lookup_pdf_regex(term: str):
     if not codes:
         return None
 
-    # rankeia códigos por (páginas com hit) + similaridade às 'keys'
+    # rankeia códigos por (#páginas com hit) + similaridade às 'keys'
     ranked = []
     for code in codes:
         pages = PDF_CODE_HITS.get(code, [])
@@ -320,13 +350,13 @@ def kb_lookup_pdf_regex(term: str):
     all_steps = []
     fontes = []
 
-    # Extrai janela de texto ao redor de cada match (prioriza onde o padrão apareceu)
     patterns = [re.compile(p, re.I) for p in MANUAL_CODES[best_code]["patterns"]]
     for p in use_pages:
-        txt = p["text"]
-        if not txt:
+        txt = p["text"] or ""
+        if not txt.strip():
             continue
-        # tenta achar a 1ª ocorrência de qualquer padrão do code
+
+        # localiza a 1ª ocorrência do code/termo e abre uma janela ao redor
         mpos = None
         for rgx in patterns:
             m = rgx.search(txt)
@@ -336,14 +366,26 @@ def kb_lookup_pdf_regex(term: str):
         start = max(0, (mpos if mpos is not None else 0) - 400)
         window = txt[start:start+1500]
 
+        # filtra linhas óbvias de cabeçalho/tabela já na janela
+        lines = [ln for ln in window.splitlines() if _is_texty(ln)]
+        window = "\n".join(lines)
+
         if not concl:
             concl = _first_informative_line(window)
-        all_steps.extend(_extract_steps(window, max_lines=10))
+
+        # tenta passos logo abaixo de títulos tipo "Procedimento", "Ação", "Solução"
+        blocos = re.split(r"(?i)\b(procedimento|ação recomendada|acao recomendada|solução|solucao|diagnóstico|diagnostico|fluxograma)\b[:\-]?", window)
+        alvo = window if len(blocos) < 3 else "".join(blocos[2:])  # pega texto após o 1º título reconhecido
+        steps_here = _extract_steps(alvo, max_lines=10)
+        if len(steps_here) < 2:  # fallback: tenta na janela toda
+            steps_here = _extract_steps(window, max_lines=10)
+
+        all_steps.extend(steps_here)
         fontes.append(f"{p['source']} p.{p['page']}")
 
-    steps = [s for s in all_steps if _is_texty(s)]
+    steps = [s for s in all_steps if _is_texty(s) and not _looks_like_table_line(s)]
 
-    # Se ficou ruim (sem texto útil), retorna None para cair na heurística/CSV
+    # guard-rail: se ainda saiu ruim, força fallback (CSV/heurística)
     if (not _is_texty(concl)) and len(steps) < 2:
         return None
 
@@ -389,10 +431,16 @@ def kb_lookup_pdf_heuristic(term: str):
         txt, norm = p["text"], p["norm"]
         pos = norm.find(qn)
         start = max(0, pos-400) if pos >= 0 else 0
-        window = txt[start:start+1400]
+        window_raw = txt[start:start+1400]
+        # limpa lixo de tabela/cabeçalho
+        window = "\n".join(ln for ln in window_raw.splitlines() if _is_texty(ln))
+
         if not concl:
             concl = _first_informative_line(window)
-        all_steps.extend(_extract_steps(window, max_lines=8))
+
+        steps_here = _extract_steps(window, max_lines=8)
+
+        all_steps.extend(steps_here)
         fontes.append(f"{p['source']} p.{p['page']}")
 
     steps = [s for s in all_steps if _is_texty(s)]
@@ -522,7 +570,7 @@ if uploaded_file is not None:
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
                         dist = df[col_b].value_counts(normalize=True) * 100
-                        dist = dist.sort_values(ascending=False)
+                        dist = dist.sort_values(ascending=True)  # opcional: ordena crescente p/ legenda melhor
                         outros = dist[dist < 5].sum()
                         dist = dist[dist >= 5]
                         if outros > 0:
