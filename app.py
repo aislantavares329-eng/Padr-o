@@ -1,7 +1,7 @@
 # app.py — Analisador Dinâmico de Planilhas (flex por tipo de coluna)
-
 import streamlit as st
 import pandas as pd
+import numpy as np
 import altair as alt
 from pandas.api.types import is_numeric_dtype
 
@@ -23,7 +23,6 @@ def read_any(file):
     return df
 
 uploaded_file = st.file_uploader("📂 Suba sua planilha (.xlsx ou .csv)", type=["xlsx", "csv"])
-
 if not uploaded_file:
     st.stop()
 
@@ -43,10 +42,10 @@ st.subheader("📊 Relação entre duas colunas")
 col_a = st.selectbox("👉 Coluna A (eixo X)", cols, key="col_a")
 col_b = st.selectbox("👉 Coluna B (cor/medida)", cols, key="col_b")
 
-relacao = None     # usado na exportação
+relacao = None   # para export
 diag = None
 
-def _safe_str(s):
+def _safe_str(s: pd.Series) -> pd.Series:
     return s.astype(str).fillna("—")
 
 if col_a and col_b:
@@ -60,19 +59,23 @@ if col_a and col_b:
         base[col_a] = _safe_str(base[col_a])
         base[col_b] = _safe_str(base[col_b])
 
+        # Top N pra B (resto -> "Outros")
         topn = st.slider(f"Top N categorias de {col_b}", 3, 20, 8, 1)
         tops = base[col_b].value_counts().nlargest(topn).index
         base.loc[~base[col_b].isin(tops), col_b] = "Outros"
 
+        # Tabela de relação
         relacao = (
             base.groupby([col_a, col_b], dropna=False)
                 .size()
-                .reset_index(name="Medida")
+                .reset_index(name="Medida")  # nome neutro p/ export/tooltip
         )
         total_por_a = relacao.groupby(col_a)["Medida"].transform("sum")
-        relacao["Percentual"] = (relacao["Medida"] / total_por_a) * 100
+        relacao["Percentual"] = (relacao["Medida"] / total_por_a.replace({0: np.nan})) * 100
 
-        modo = st.radio("Modo do gráfico", ["Quantidade", "Percentual (100%))"], horizontal=True, key="modo_catcat")
+        # Gráfico barras empilhadas vs 100%
+        modo = st.radio("Modo do gráfico", ["Quantidade", "Percentual (100%)"],
+                        horizontal=True, key="modo_catcat")
         y_enc = (alt.Y("sum(Medida):Q", title="Quantidade")
                  if modo == "Quantidade"
                  else alt.Y("sum(Medida):Q", title="Percentual", stack="normalize"))
@@ -90,7 +93,7 @@ if col_a and col_b:
                   tooltip=[
                       alt.Tooltip(f"{col_a}:N", title=col_a),
                       alt.Tooltip(f"{col_b}:N", title=col_b),
-                      alt.Tooltip("Medida:Q",   title="Quantidade"),
+                      alt.Tooltip("Medida:Q", title="Quantidade"),
                       alt.Tooltip("Percentual:Q", title="Percentual", format=".1f"),
                   ],
               )
@@ -100,12 +103,21 @@ if col_a and col_b:
         )
         st.altair_chart(chart, use_container_width=True)
 
-        # Donut de B
+        # Donut robusto da distribuição de B
         st.subheader(f"🥧 Distribuição de {col_b}")
-        dist = (base[col_b].value_counts().reset_index()
-                .rename(columns={"index": col_b, col_b: "Medida"}))
-        total = dist["Medida"].sum()
-        dist["Percentual"] = dist["Medida"] / total * 100
+        dist = (
+            base[col_b]
+              .astype(str)
+              .value_counts(dropna=False)
+              .reset_index(name="Medida")
+              .rename(columns={"index": col_b})
+        )
+        # garante numérico e evita crash de tipo
+        dist["Medida"] = pd.to_numeric(dist["Medida"], errors="coerce").fillna(0).astype(float)
+        total = float(dist["Medida"].sum())
+        dist["Percentual"] = 0.0 if total == 0 else (dist["Medida"] / total) * 100.0
+        dist = dist.sort_values("Medida", ascending=False)
+
         donut = (
             alt.Chart(dist)
               .mark_arc(outerRadius=120, innerRadius=60)
@@ -124,7 +136,9 @@ if col_a and col_b:
         st.altair_chart(donut, use_container_width=True)
 
         maior = relacao.loc[relacao["Medida"].idxmax()]
-        diag = f"⚠️ Diagnóstico: **{maior[col_a]} × {maior[col_b]}** teve **{maior['Medida']}** ({maior['Percentual']:.1f}%)."
+        diag = (f"⚠️ Diagnóstico:\n\n"
+                f"- **{maior[col_a]} × {maior[col_b]}** teve **{int(maior['Medida'])} ocorrências** "
+                f"({maior['Percentual']:.1f}%).")
 
     # ===== Caso 2: A categórica, B numérica → barra agregada =====
     elif not A_num and B_num:
@@ -188,7 +202,8 @@ if col_a and col_b:
               )
         )
         chart = points + points.transform_regression(col_a, col_b).mark_line() if show_trend else points
-        st.altair_chart(chart.properties(height=360).configure_view(stroke=None), use_container_width=True)
+        st.altair_chart(chart.properties(height=360).configure_view(stroke=None),
+                        use_container_width=True)
 
 # ==============================
 # Exportar Excel (se houver "relacao")
@@ -203,12 +218,12 @@ if st.button("📥 Gerar Relatório Excel"):
             if relacao is not None and not relacao.empty:
                 relacao.to_excel(writer, sheet_name="Relação", index=False)
                 ws = writer.sheets["Relação"]
+
                 # Colunas: 0 = col_a, 1 = col_b (se existir), 2 = Medida
-                has_two = (2 in range(relacao.shape[1])) and (col_b in relacao.columns)
                 chart = wb.add_chart({"type": "column"})
                 chart.add_series({
-                    "categories": ["Relação", 1, 0, len(relacao), 0],
-                    "values":     ["Relação", 1, 2, len(relacao), 2],
+                    "categories": ["Relação", 1, 0, len(relacao), 0],  # eixo X = col_a
+                    "values":     ["Relação", 1, 2, len(relacao), 2],  # Medida
                     "name":       f"{col_a}" + (f" × {col_b}" if col_b in relacao.columns else ""),
                 })
                 chart.set_title({"name": "Relação"})
