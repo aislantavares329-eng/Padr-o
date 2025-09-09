@@ -1,7 +1,7 @@
 # app.py — Analisador Dinâmico de Planilhas
 # Barras (Altair), pizza (matplotlib), diagnóstico original,
-# IA do manual com PDF (pypdf/PyPDF2) robusta + CSV fallback.
-# -> Filtra linhas numéricas/tabelas e só aceita passos textuais.
+# IA do manual com PDF robusta (regex + heurística) + CSV fallback.
+# Filtro anti-tabela/numérico nos passos (nada de "10 12 24...").
 
 import io
 import re
@@ -120,6 +120,7 @@ ALIASES = {
     "cabeçote sujo": "cabeçote requer limpeza ao desligar",
     "ausencia de impressao": "impressão clara / faded",
     "perda de modulacao": "impressão clara / faded",
+    "baixa pressao": "low pressure",
 }
 ALIASES_NORM = { _norm(k): _norm(v) for k, v in ALIASES.items() }
 
@@ -213,35 +214,155 @@ def _extract_steps(text: str, max_lines: int = 12) -> list:
             seen.add(k)
     return uniq
 
-# Expansão simples de sinônimos/termos (ajuste se quiser)
-QUERY_EXPAND = {
-    "nozzle clog / entupimento de bico": ["nozzle","clog","entupimento","bico","jato","nozzle clog"],
-    "low pressure": ["baixa pressão","pressao baixa","pressure","pressão"],
-    "alta viscosidade": ["viscosidade","make-up","solvente"],
+# ===========================
+# Mapeamento por REGEX → seções do manual
+# ===========================
+# Cada entrada define: "chaves" (para similaridade) e "padroes" (o que procurar no PDF)
+MANUAL_CODES = {
+    "3.18 Baixa pressão": {
+        "keys": "baixa pressão low pressure pressao baixa fc006",
+        "patterns": [r"\b3\.18\b", r"\blow[\s\-]?pressure\b", r"\bbaixa\s+press(ão|ao)\b", r"\bFC006\b"],
+    },
+    "3.28 Cabeçote requer limpeza ao desligar": {
+        "keys": "cabeçote limpeza head clean shutdown",
+        "patterns": [r"\b3\.28\b", r"\bcabe(ç|c)ote.*limpez", r"\bhead.*clean", r"\bclean.*head"],
+    },
+    "3.20 Sem Tempo de Voo (TOF)": {
+        "keys": "sem tof no tof tempo de voo time of flight",
+        "patterns": [r"\b3\.20\b", r"\btempo\s+de\s+voo\b", r"\btime\s+of\s+flight\b", r"\bTOF\b"],
+    },
+    "2.12 Viscosidade": {
+        "keys": "viscosidade viscosity 2.12",
+        "patterns": [r"\b2\.12\b", r"\bviscosidad", r"\bviscosit"],
+    },
+    "2.03 Tempo de Voo": {
+        "keys": "tempo de voo time of flight 2.03",
+        "patterns": [r"\b2\.03\b", r"\btempo\s+de\s+voo\b", r"\btime\s+of\s+flight\b"],
+    },
 }
 
-def _expand_query(term_norm: str) -> set:
-    base = set(_tokens(term_norm))
-    target = ALIASES_NORM.get(term_norm, term_norm)
-    base |= _tokens(target)
-    for key, arr in QUERY_EXPAND.items():
-        if key in target:
-            for a in arr:
-                base |= _tokens(a)
-    return base or set(_tokens(term_norm))
+# Aliases regex (mapa rápido termo → uma ou mais chaves do manual)
+ALIASES_REGEX = [
+    (re.compile(r"\bfalha (do|de) jato\b", re.I), ["3.18 Baixa pressão", "3.20 Sem Tempo de Voo (TOF)"]),
+    (re.compile(r"\bcabe(ç|c)ote.*sujo\b", re.I), ["3.28 Cabeçote requer limpeza ao desligar"]),
+    (re.compile(r"\bpress(ã|a)o baixa\b", re.I), ["3.18 Baixa pressão"]),
+    (re.compile(r"\bviscosidad", re.I), ["2.12 Viscosidade"]),
+    (re.compile(r"\btempo\s+de\s+voo\b|\bTOF\b", re.I), ["3.20 Sem Tempo de Voo (TOF)", "2.03 Tempo de Voo"]),
+]
 
-# ===========================
-# Lookup no PDF (robusto)
-# ===========================
-def kb_lookup_pdf(term: str):
-    """Busca termo nos PDFs e retorna {conclusao, solucoes, fonte};
-       se só achar tabela/números, devolve None (cai pro CSV)."""
-    if not PDF_PAGES:
+@st.cache_data(show_spinner=False)
+def index_pdf_by_codes(pages):
+    """Pré-indexa páginas por código do manual (regex)."""
+    if not pages:
+        return {}
+    compiled = {
+        code: [re.compile(pat, re.I) for pat in data["patterns"]]
+        for code, data in MANUAL_CODES.items()
+    }
+    hits = {code: [] for code in MANUAL_CODES.keys()}  # code -> list of page dicts
+    for p in pages:
+        txt = p["text"] or ""
+        for code, regs in compiled.items():
+            if any(r.search(txt) for r in regs):
+                hits[code].append(p)
+    return hits
+
+PDF_CODE_HITS = index_pdf_by_codes(PDF_PAGES)
+
+def _candidate_codes_from_term(term_norm: str) -> list:
+    """Gera lista de códigos candidatos a partir do termo (aliases + similaridade)."""
+    cands = set()
+    # 1) aliases (regex)
+    for rgx, codes in ALIASES_REGEX:
+        if rgx.search(term_norm):
+            cands.update(codes)
+    # 2) similaridade por tokens com 'keys' de cada code
+    for code, meta in MANUAL_CODES.items():
+        sim = _score_jaccard(_tokens(term_norm), _tokens(meta["keys"]))
+        if sim >= 0.25:
+            cands.add(code)
+    # 3) se mapeamos ALIASES textuais
+    mapped = ALIASES_NORM.get(term_norm, None)
+    if mapped:
+        for code, meta in MANUAL_CODES.items():
+            if mapped in meta["keys"]:
+                cands.add(code)
+    # garante ordem estável
+    return list(cands)
+
+def kb_lookup_pdf_regex(term: str):
+    """Primeiro: usar mapeamento por regex → seções. Se achar, extrai Conclusão+Passos."""
+    if not PDF_PAGES or not PDF_CODE_HITS:
         return None
 
+    tn = _norm(term)
+    codes = _candidate_codes_from_term(tn)
+    if not codes:
+        return None
+
+    # rankeia códigos por (páginas com hit) + similaridade às 'keys'
+    ranked = []
+    for code in codes:
+        pages = PDF_CODE_HITS.get(code, [])
+        if not pages:
+            continue
+        sim = _score_jaccard(_tokens(tn), _tokens(MANUAL_CODES[code]["keys"]))
+        score = len(pages)*0.8 + sim*2.2
+        ranked.append((score, code, pages))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    _, best_code, best_pages = ranked[0]
+
+    # pega até 2 páginas com esse código
+    use_pages = best_pages[:2]
+    concl = ""
+    all_steps = []
+    fontes = []
+
+    # Extrai janela de texto ao redor de cada match (prioriza onde o padrão apareceu)
+    patterns = [re.compile(p, re.I) for p in MANUAL_CODES[best_code]["patterns"]]
+    for p in use_pages:
+        txt = p["text"]
+        if not txt:
+            continue
+        # tenta achar a 1ª ocorrência de qualquer padrão do code
+        mpos = None
+        for rgx in patterns:
+            m = rgx.search(txt)
+            if m:
+                mpos = m.start()
+                break
+        start = max(0, (mpos if mpos is not None else 0) - 400)
+        window = txt[start:start+1500]
+
+        if not concl:
+            concl = _first_informative_line(window)
+        all_steps.extend(_extract_steps(window, max_lines=10))
+        fontes.append(f"{p['source']} p.{p['page']}")
+
+    steps = [s for s in all_steps if _is_texty(s)]
+
+    # Se ficou ruim (sem texto útil), retorna None para cair na heurística/CSV
+    if (not _is_texty(concl)) and len(steps) < 2:
+        return None
+
+    return {
+        "conclusao": concl.strip() if _is_texty(concl) else "",
+        "solucoes": steps[:10],
+        "fonte": f"{best_code} — " + ", ".join(fontes),
+    }
+
+# ===========================
+# Lookup no PDF (heurística genérica) — fallback do regex
+# ===========================
+def kb_lookup_pdf_heuristic(term: str):
+    """Heurística: procura por tokens e termo no PDF (caso regex não encaixe)."""
+    if not PDF_PAGES:
+        return None
     qn = _norm(term)
     qn = ALIASES_NORM.get(qn, qn)  # alias
-    q_tokens = _expand_query(qn)
+    q_tokens = _tokens(qn)
 
     scored = []
     for p in PDF_PAGES:
@@ -267,22 +388,14 @@ def kb_lookup_pdf(term: str):
     for p in top_pages:
         txt, norm = p["text"], p["norm"]
         pos = norm.find(qn)
-        if pos < 0:
-            for t in sorted(q_tokens, key=len, reverse=True):
-                pos = norm.find(t)
-                if pos >= 0:
-                    break
         start = max(0, pos-400) if pos >= 0 else 0
         window = txt[start:start+1400]
-
         if not concl:
             concl = _first_informative_line(window)
         all_steps.extend(_extract_steps(window, max_lines=8))
         fontes.append(f"{p['source']} p.{p['page']}")
 
     steps = [s for s in all_steps if _is_texty(s)]
-
-    # se ficou ruim (sem texto útil), retorna None para cair no CSV
     if (not _is_texty(concl)) and len(steps) < 2:
         return None
 
@@ -323,8 +436,11 @@ def kb_lookup_csv(term: str, cutoff_close=0.65, cutoff_jacc=0.35):
     return None
 
 def kb_lookup(term: str, prefer_pdf=True):
+    """Orquestração: Regex→PDF → Heurística→PDF → CSV."""
     if prefer_pdf and PDF_PAGES and PDF_BACKEND is not None:
-        hit = kb_lookup_pdf(term)
+        hit = kb_lookup_pdf_regex(term)
+        if not hit:
+            hit = kb_lookup_pdf_heuristic(term)
         if hit and (hit["conclusao"] or hit["solucoes"]):
             return hit
     return kb_lookup_csv(term)
