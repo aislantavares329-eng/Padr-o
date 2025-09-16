@@ -41,7 +41,7 @@ st.title("📊 Analisador Dinâmico de Planilhas")
 # ===========================
 
 pdf_files = st.sidebar.file_uploader(
-    
+    "Ou suba **um ou mais PDFs** do manual",
     type=["pdf"], key="pdfs", accept_multiple_files=True
 )
 usar_pdf = st.sidebar.toggle("🔎 Usar manual em PDF com prioridade", value=True)
