@@ -70,7 +70,7 @@ def _score_jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 # ===========================
-# Carregar CSV do manual
+# Carregar CSV do manual (se houver). Aqui vamos passar None.
 # ===========================
 @st.cache_data
 def load_kb(file):
@@ -112,7 +112,8 @@ KB_DEFAULT = pd.DataFrame([
 KB_DEFAULT["termo_norm"] = KB_DEFAULT["termo"].map(_norm)
 KB_DEFAULT["tokens"] = KB_DEFAULT["termo"].map(lambda s: _tokens(str(s)))
 
-kb_user = load_kb(kb_file)
+# >>>>>>> correção: sem 'kb_file'; usamos None e seguimos com o fallback/CSV interno
+kb_user = load_kb(None)
 KB_ALL = (pd.concat([kb_user, KB_DEFAULT], ignore_index=True)
           if not kb_user.empty else KB_DEFAULT)
 
@@ -167,7 +168,6 @@ def _looks_like_toc_entry(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
-    # …… 228 | …… 5—228 | ...... 79 | texto ....... 228
     if re.search(r"\.{2,}\s*\d+(\s*[–—-]\s*\d+)?$", s):
         return True
     if re.search(r"[\.·\s]{3,}\d+(\s*[–—-]\s*\d+)?$", s):
@@ -180,20 +180,16 @@ def _looks_like_table_line(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
-    # linhas com quase só dígitos/NA/pontuação
     if re.fullmatch(r"(?:[\d\.\-\/\s]|N/?A)+", s, flags=re.I):
         return True
-    # 3+ blocos numéricos seguidos (grade)
     if re.search(r"(?:\d[\d\./-]*\s+){3,}\d[\d\./-]*", s):
         return True
-    # abreviações maiúsculas curtas dominantes
     tokens = s.split()
     if tokens and sum(t.isupper() and len(t) <= 4 for t in tokens) / len(tokens) > 0.7:
         return True
     return False
 
 def _is_texty(s: str) -> bool:
-    """True se parece frase normal (não tabela/cabeçalho/TOC/numérica)."""
     s = (s or "").strip()
     if not s or len(s) < 8:
         return False
@@ -202,23 +198,19 @@ def _is_texty(s: str) -> bool:
     sn = s.lower()
     if any(w in sn for w in _BAD_WORDS):
         return False
-    # proporção de letras vs dígitos
     letters = sum(ch.isalpha() for ch in s)
     digits  = sum(ch.isdigit()  for ch in s)
     if digits > letters * 0.6:
         return False
-    # precisa ter pelo menos 2 palavras com letras
     if sum(1 for t in s.split() if any(c.isalpha() for c in t)) < 2:
         return False
     return True
 
 def _first_informative_line(block: str) -> str:
-    """Escolhe linha boa p/ conclusão; pula TOC/cabeçalho e prioriza palavras-chave."""
     KEYS = ("causa","cause","sintoma","symptom","descrição","description",
             "ação","acao","procedimento","solução","solucao","falha","fault",
             "avaria","problem","issue")
     lines_all = [ln.strip() for ln in (block or "").splitlines()]
-    # limpa tudo que for TOC/tabela/cabeçalho
     lines = [ln for ln in lines_all if _is_texty(ln)]
     if not lines:
         return ""
@@ -231,7 +223,6 @@ def _first_informative_line(block: str) -> str:
     return lines[0]
 
 def _extract_steps(text: str, max_lines: int = 12) -> list:
-    """Extrai passos práticos; exige bullet/numeração/verbos e barra linhas numéricas."""
     VERBS = ("verificar","checar","inspecionar","executar","limpar","ajustar",
              "substituir","alinhar","recolocar","testar","revisar","aguardar",
              "apertar","conferir","drenar","pressurizar","desobstruir")
@@ -253,7 +244,6 @@ def _extract_steps(text: str, max_lines: int = 12) -> list:
                 steps.append(clean)
         if len(steps) >= max_lines:
             break
-    # de-dup
     uniq, seen = [], set()
     for s in steps:
         k = _norm(s)
@@ -265,7 +255,6 @@ def _extract_steps(text: str, max_lines: int = 12) -> list:
 # ===========================
 # Mapeamento por REGEX → seções do manual
 # ===========================
-# Cada entrada define: "keys" (para similaridade) e "patterns" (o que procurar no PDF)
 MANUAL_CODES = {
     "3.18 Baixa pressão": {
         "keys": "baixa pressão low pressure pressao baixa fc006",
@@ -289,7 +278,6 @@ MANUAL_CODES = {
     },
 }
 
-# Aliases regex (mapa rápido termo → uma ou mais chaves do manual)
 ALIASES_REGEX = [
     (re.compile(r"\bfalha (do|de) jato\b", re.I), ["3.18 Baixa pressão", "3.20 Sem Tempo de Voo (TOF)"]),
     (re.compile(r"\bcabe(ç|c)ote.*sujo\b", re.I), ["3.28 Cabeçote requer limpeza ao desligar"]),
@@ -300,14 +288,13 @@ ALIASES_REGEX = [
 
 @st.cache_data(show_spinner=False)
 def index_pdf_by_codes(pages):
-    """Pré-indexa páginas por código do manual (regex)."""
     if not pages:
         return {}
     compiled = {
         code: [re.compile(pat, re.I) for pat in data["patterns"]]
         for code, data in MANUAL_CODES.items()
     }
-    hits = {code: [] for code in MANUAL_CODES.keys()}  # code -> list of page dicts
+    hits = {code: [] for code in MANUAL_CODES.keys()}
     for p in pages:
         txt = p["text"] or ""
         for code, regs in compiled.items():
@@ -318,37 +305,28 @@ def index_pdf_by_codes(pages):
 PDF_CODE_HITS = index_pdf_by_codes(PDF_PAGES)
 
 def _candidate_codes_from_term(term_norm: str) -> list:
-    """Gera lista de códigos candidatos a partir do termo (aliases + similaridade)."""
     cands = set()
-    # 1) aliases (regex)
     for rgx, codes in ALIASES_REGEX:
         if rgx.search(term_norm):
             cands.update(codes)
-    # 2) similaridade por tokens com 'keys' de cada code
     for code, meta in MANUAL_CODES.items():
         sim = _score_jaccard(_tokens(term_norm), _tokens(meta["keys"]))
         if sim >= 0.25:
             cands.add(code)
-    # 3) se mapeamos ALIASES textuais
     mapped = ALIASES_NORM.get(term_norm, None)
     if mapped:
         for code, meta in MANUAL_CODES.items():
             if mapped in meta["keys"]:
                 cands.add(code)
-    # garante ordem estável
     return list(cands)
 
 def kb_lookup_pdf_regex(term: str):
-    """Primeiro: usar mapeamento por regex → seções. Se achar, extrai Conclusão+Passos."""
     if not PDF_PAGES or not PDF_CODE_HITS:
         return None
-
     tn = _norm(term)
     codes = _candidate_codes_from_term(tn)
     if not codes:
         return None
-
-    # rankeia códigos por (#páginas com hit) + similaridade às 'keys'
     ranked = []
     for code in codes:
         pages = PDF_CODE_HITS.get(code, [])
@@ -362,7 +340,6 @@ def kb_lookup_pdf_regex(term: str):
     ranked.sort(key=lambda x: x[0], reverse=True)
     _, best_code, best_pages = ranked[0]
 
-    # pega até 2 páginas com esse código
     use_pages = best_pages[:2]
     concl = ""
     all_steps = []
@@ -373,8 +350,6 @@ def kb_lookup_pdf_regex(term: str):
         txt = p["text"] or ""
         if not txt.strip():
             continue
-
-        # localiza a 1ª ocorrência do code/termo e abre uma janela ao redor
         mpos = None
         for rgx in patterns:
             m = rgx.search(txt)
@@ -383,26 +358,18 @@ def kb_lookup_pdf_regex(term: str):
                 break
         start = max(0, (mpos if mpos is not None else 0) - 400)
         window = txt[start:start+1500]
-
-        # limpa linhas de TOC/tabela/cabeçalho ANTES de selecionar conclusão e passos
         window = "\n".join(ln for ln in window.splitlines() if _is_texty(ln))
-
         if not concl:
             concl = _first_informative_line(window)
-
-        # tenta passos logo abaixo de títulos tipo "Procedimento", "Ação", "Solução"
         blocos = re.split(r"(?i)\b(procedimento|ação recomendada|acao recomendada|solução|solucao|diagnóstico|diagnostico|fluxograma)\b[:\-]?", window)
-        alvo = window if len(blocos) < 3 else "".join(blocos[2:])  # pega texto após o 1º título reconhecido
+        alvo = window if len(blocos) < 3 else "".join(blocos[2:])
         steps_here = _extract_steps(alvo, max_lines=10)
-        if len(steps_here) < 2:  # fallback: tenta na janela toda
+        if len(steps_here) < 2:
             steps_here = _extract_steps(window, max_lines=10)
-
         all_steps.extend(steps_here)
         fontes.append(f"{p['source']} p.{p['page']}")
 
     steps = [s for s in all_steps if _is_texty(s) and not _looks_like_table_line(s)]
-
-    # guard-rail: se ainda saiu ruim, força fallback (CSV/heurística)
     if (not _is_texty(concl)) and len(steps) < 2:
         return None
 
@@ -412,15 +379,11 @@ def kb_lookup_pdf_regex(term: str):
         "fonte": f"{best_code} — " + ", ".join(fontes),
     }
 
-# ===========================
-# Lookup no PDF (heurística genérica) — fallback do regex
-# ===========================
 def kb_lookup_pdf_heuristic(term: str):
-    """Heurística: procura por tokens e termo no PDF (caso regex não encaixe)."""
     if not PDF_PAGES:
         return None
     qn = _norm(term)
-    qn = ALIASES_NORM.get(qn, qn)  # alias
+    qn = ALIASES_NORM.get(qn, qn)
     q_tokens = _tokens(qn)
 
     scored = []
@@ -438,7 +401,7 @@ def kb_lookup_pdf_heuristic(term: str):
         return None
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top_pages = [s[1] for s in scored[:2]]  # combina até 2 páginas
+    top_pages = [s[1] for s in scored[:2]]
 
     concl = ""
     all_steps = []
@@ -449,14 +412,10 @@ def kb_lookup_pdf_heuristic(term: str):
         pos = norm.find(qn)
         start = max(0, pos-400) if pos >= 0 else 0
         window_raw = txt[start:start+1400]
-        # limpa lixo de tabela/cabeçalho
         window = "\n".join(ln for ln in window_raw.splitlines() if _is_texty(ln))
-
         if not concl:
             concl = _first_informative_line(window)
-
         steps_here = _extract_steps(window, max_lines=8)
-
         all_steps.extend(steps_here)
         fontes.append(f"{p['source']} p.{p['page']}")
 
@@ -511,7 +470,7 @@ def kb_lookup(term: str, prefer_pdf=True):
     return kb_lookup_csv(term)
 
 # ===========================
-# Ações baseadas no diagnóstico (combinação col_a x col_b) + 5W2H
+# Ações baseadas no diagnóstico + 5W2H
 # ===========================
 CONTEXT_FALLBACKS = {
     "surto de tensao": [
@@ -551,7 +510,6 @@ def _pick_fallback(defect_norm: str) -> list[str]:
     for key in CONTEXT_FALLBACKS.keys():
         if key in defect_norm:
             return CONTEXT_FALLBACKS[key]
-    # alias rápidos
     if "tempo de voo" in defect_norm or "tof" in defect_norm:
         return CONTEXT_FALLBACKS["tof"]
     if "cabeçote" in defect_norm and "limpeza" in defect_norm:
@@ -561,29 +519,21 @@ def _pick_fallback(defect_norm: str) -> list[str]:
 def build_actions_from_diagnostic(top_row, col_a, col_b, kb_res,
                                   resp_padrao="Manutenção", prazo=7, custo="—",
                                   modo_5w2h=False):
-    """Gera plano contextual usando (col_a x col_b) + manual (ou fallback).
-       Se modo_5w2h=True, retorna DataFrame 5W2H; senão, markdown."""
     asset  = str(top_row[col_a])
     defect = str(top_row[col_b])
     occ    = int(top_row["QTD"])
     defect_norm = _norm(defect)
 
-    # 1) passos do manual, se houver
     steps = []
     fonte = ""
     if kb_res and kb_res.get("solucoes"):
         steps = list(kb_res["solucoes"])
         fonte = kb_res.get("fonte", "")
-
-    # 2) senão, fallback pelo tipo de defeito
     if not steps:
         steps = _pick_fallback(defect_norm)
-
-    # personaliza com o ativo/linha
     steps = [s.replace("{ASSET}", asset) for s in steps]
 
     if not modo_5w2h:
-        # plano em markdown
         plano = []
         plano.append(f"**Contexto:** `{asset} x {defect}` — **{occ}** ocorrências (janela analisada).")
         if kb_res and kb_res.get("conclusao"):
@@ -598,7 +548,6 @@ def build_actions_from_diagnostic(top_row, col_a, col_b, kb_res,
             plano.append(f"*Fonte:* {fonte}")
         return "\n\n".join(plano)
 
-    # 5W2H
     deadline = (datetime.today() + timedelta(days=prazo)).strftime("%Y-%m-%d")
     rows = []
     why = f"Reduzir recorrência de **{defect}** no ativo **{asset}** ({occ} ocorrências)"
@@ -615,7 +564,6 @@ def build_actions_from_diagnostic(top_row, col_a, col_b, kb_res,
         })
     df5w2h = pd.DataFrame(rows)
     if fonte:
-        # adiciona fonte como nota (mostrar abaixo da tabela)
         df5w2h.attrs["fonte"] = fonte
     return df5w2h
 
@@ -653,7 +601,6 @@ if uploaded_file is not None:
         col_a = st.selectbox("👉 Primeira coluna categórica", cols, key="cata")
         col_b = st.selectbox("👉 Segunda coluna categórica", cols, key="catb")
 
-        # Qual coluna consultar no manual? (em geral: a 2ª — defeito/causa)
         coluna_manual = st.radio("Consultar manual usando qual coluna?",
                                  [col_b, col_a], index=0, horizontal=True)
 
@@ -671,7 +618,6 @@ if uploaded_file is not None:
                 )
 
                 if not relacao.empty:
-                    # --- Barras (Altair) ---
                     chart = (
                         alt.Chart(relacao)
                            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
@@ -692,7 +638,6 @@ if uploaded_file is not None:
                     )
                     st.altair_chart(chart, use_container_width=True)
 
-                    # --- Pizza (igual ao seu original) ---
                     if MATPLOTLIB_OK:
                         st.subheader(f"🥧 Distribuição de {col_b}")
                         dist = df[col_b].value_counts(normalize=True) * 100
@@ -711,7 +656,6 @@ if uploaded_file is not None:
                         ax.set_title(f"Distribuição de {col_b}", fontsize=14)
                         st.pyplot(fig)
 
-                    # --- Diagnóstico original ---
                     top = relacao.sort_values("QTD", ascending=False).iloc[0]
                     diag = (
                         f"⚠️ Diagnóstico Preventivo:\n\n"
@@ -721,11 +665,9 @@ if uploaded_file is not None:
                     )
                     st.success(diag)
 
-                    # --- IA do Manual (PDF prioritário) ---
                     termo_para_consulta = str(top[coluna_manual])
                     kb_res = kb_lookup(termo_para_consulta, prefer_pdf=usar_pdf)
 
-                    # --- Plano amarrado ao diagnóstico (Markdown ou 5W2H) ---
                     with st.expander("🧠 Conclusão & Plano (baseado no diagnóstico)", expanded=True):
                         plano = build_actions_from_diagnostic(
                             top, col_a, col_b, kb_res,
@@ -738,13 +680,11 @@ if uploaded_file is not None:
                             st.dataframe(plano, use_container_width=True)
                             if hasattr(plano, "attrs") and "fonte" in plano.attrs and plano.attrs["fonte"]:
                                 st.caption(f"Fonte: {plano.attrs['fonte']}")
-                            # download CSV do 5W2H
                             csv = plano.to_csv(index=False).encode("utf-8")
                             st.download_button("⬇️ Baixar 5W2H (CSV)", csv, file_name="plano_5w2h.csv")
                         else:
                             st.markdown(plano)
 
-                        # mostra fonte do manual se não estiver no 5W2H
                         if (not modo_5w2h) and kb_res and kb_res.get("fonte"):
                             st.caption(f"Fonte: {kb_res['fonte']}")
 
