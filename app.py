@@ -39,11 +39,7 @@ st.title("📊 Analisador Dinâmico de Planilhas")
 # ===========================
 # Sidebar: Manual + Plano
 # ===========================
-st.sidebar.markdown("### 📘 Manual (opcional)")
-kb_file = st.sidebar.file_uploader(
-    "Suba manual **CSV/XLSX** (colunas: termo, conclusao, solucoes)",
-    type=["csv", "xlsx"], key="kb"
-)
+
 pdf_files = st.sidebar.file_uploader(
     "Ou suba **um ou mais PDFs** do manual",
     type=["pdf"], key="pdfs", accept_multiple_files=True
