@@ -582,7 +582,7 @@ def read_any(file):
             df = pd.read_csv(file)
     return df
 
-uploaded_file = st.file_uploader("📂 Suba sua planilha (.xlsx ou .csv)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("📂 Suba sua planilha que contenha colunas com Causas , Defeitos (.xlsx ou .csv)", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     try:
